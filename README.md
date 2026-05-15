@@ -34,7 +34,18 @@ Copy-Item -Recurse genies-skills/skills/network-proxy $env:USERPROFILE\.openclaw
 cp -r genies-skills/skills/network-proxy ~/.openclaw/workspace/skills/network-proxy
 ```
 
-安装后重启 OpenClaw Gateway 即可生效。
+安装后需进行首次配置，告诉技能你的 v2rayN 安装位置：
+
+```powershell
+# 方式一：创建配置文件
+cd $env:USERPROFILE\.openclaw\workspace\skills\network-proxy\scripts
+@{"v2rayN_exe"="D:\path\to\v2rayN.exe"; "proxy_port"=10808} | ConvertTo-Json | Out-File proxy-config.json -Encoding UTF8
+
+# 方式二：设置环境变量
+$env:V2RAYN_EXE = "D:\path\to\v2rayN.exe"
+```
+
+配置完成后重启 OpenClaw Gateway 即可生效。
 
 ## 📁 目录结构
 

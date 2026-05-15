@@ -4,10 +4,13 @@
 .DESCRIPTION
   Manages the v2rayN proxy: start, stop, status, test, and configure
   environment variables for CLI tools.
+  
+  CONFIGURATION: Create proxy-config.json in the same directory, or
+  set environment variables V2RAYN_EXE / PROXY_PORT.
+  If neither is provided, the script will auto-detect v2rayN.
 .NOTES
-  This script is designed to be called by the AI assistant (Alien) when
-  network connectivity issues are detected while accessing sites like
-  Google, GitHub, HuggingFace, etc.
+  Portable version for distribution via genies-skills repository.
+  No hardcoded paths or sensitive information.
 #>
 
 param(
@@ -19,23 +22,84 @@ param(
     [int]$TimeoutSeconds = 30,
 
     [Parameter(Mandatory=$false)]
-    [string]$TestUrl = "https://www.google.com"
+    [string]$TestUrl = "https://www.google.com",
+
+    [Parameter(Mandatory=$false)]
+    [string]$V2rayNPath = "",
+
+    [Parameter(Mandatory=$false)]
+    [int]$ProxyPort = 0
 )
 
-# ─── Configuration ───────────────────────────────────────────────
-$V2RAYN_EXE   = "D:\soft\v2rayN-windows-64-SelfContained\v2rayN.exe"
-$V2RAYN_DIR   = "D:\soft\v2rayN-windows-64-SelfContained"
-$PROXY_HOST   = "127.0.0.1"
-$PROXY_PORT   = 10808       # SOCKS5 port
-$PROXY_TYPE   = "socks5"
+# ─── Configuration Resolution ────────────────────────────────────
+
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ConfigFile = Join-Path $ScriptDir "proxy-config.json"
+
+# Try loading from config file
+$config = $null
+if (Test-Path $ConfigFile) {
+    try {
+        $config = Get-Content $ConfigFile -Raw | ConvertFrom-Json
+    } catch {
+        # Ignore malformed config
+    }
+}
+
+# Resolve v2rayN path: param > env var > config file > auto-detect
+function Resolve-V2rayNPath {
+    param([string]$ExplicitPath, $Config)
+
+    # 1. Command-line parameter
+    if ($ExplicitPath -and (Test-Path $ExplicitPath)) { return $ExplicitPath }
+
+    # 2. Environment variable
+    $envPath = $env:V2RAYN_EXE
+    if ($envPath -and (Test-Path $envPath)) { return $envPath }
+
+    # 3. Config file
+    $cfgPath = $Config.v2rayN_exe
+    if ($cfgPath -and (Test-Path $cfgPath)) { return $cfgPath }
+
+    # 4. Auto-detect: common paths
+    $searchPaths = @(
+        "$env:USERPROFILE\Desktop\v2rayN*\v2rayN.exe",
+        "$env:LOCALAPPDATA\v2rayN\v2rayN.exe",
+        "$env:PROGRAMFILES\v2rayN\v2rayN.exe",
+        "${env:ProgramFiles(x86)}\v2rayN\v2rayN.exe",
+        "$env:USERPROFILE\Downloads\v2rayN*\v2rayN.exe",
+        "D:\soft\v2rayN*\v2rayN.exe",
+        "C:\v2rayN\v2rayN.exe"
+    )
+    foreach ($p in $searchPaths) {
+        $found = Get-Item $p -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($found) { return $found.FullName }
+    }
+
+    return $null
+}
+
+function Resolve-ProxyPort {
+    param($ExplicitPort, $Config)
+    if ($ExplicitPort -gt 0) { return $ExplicitPort }
+    $envPort = $env:PROXY_PORT
+    if ($envPort) { return [int]$envPort }
+    if ($Config.proxy_port) { return [int]$Config.proxy_port }
+    return 10808  # v2rayN default
+}
+
+# Resolve configuration
+$V2RAYN_EXE = Resolve-V2rayNPath -ExplicitPath $V2rayNPath -Config $config
+$V2RAYN_DIR = if ($V2RAYN_EXE) { Split-Path -Parent $V2RAYN_EXE } else { $null }
+$PROXY_HOST = "127.0.0.1"
+$PROXY_PORT = Resolve-ProxyPort -ExplicitPort $ProxyPort -Config $config
+$PROXY_TYPE = "socks5"
 
 # Environment variable names
 $ENV_HTTP     = "HTTP_PROXY"
 $ENV_HTTPS    = "HTTPS_PROXY"
 $ENV_ALL      = "ALL_PROXY"
 $ENV_NO_PROXY = "NO_PROXY"
-
-# Sites to exclude from proxy (local/CN sites)
 $NO_PROXY_VAL = "localhost,127.0.0.1,*.cn,*.local,.local,.cn"
 
 # ─── Helper Functions ────────────────────────────────────────────
@@ -63,12 +127,6 @@ function Write-Warn {
 # ─── Core Functions ──────────────────────────────────────────────
 
 function Get-ProxyStatus {
-    <#
-    .SYNOPSIS
-      Check if v2rayN proxy is running by testing port connectivity.
-    .OUTPUTS
-      Returns a hashtable with keys: Running (bool), ProcessId, Port, Message
-    #>
     $status = @{
         Running   = $false
         ProcessId = $null
@@ -76,7 +134,6 @@ function Get-ProxyStatus {
         Message   = ""
     }
 
-    # Check if v2rayN process is running
     $proc = Get-Process -Name "v2rayN" -ErrorAction SilentlyContinue
     if (-not $proc) {
         $status.Message = "v2rayN process not running"
@@ -84,10 +141,8 @@ function Get-ProxyStatus {
     }
     $status.ProcessId = $proc.Id
 
-    # Check core processes (Xray or sing-box)
     $coreProc = Get-Process -Name "xray", "sing-box" -ErrorAction SilentlyContinue
 
-    # Check if port is listening
     $conn = Test-NetConnection -ComputerName $PROXY_HOST -Port $PROXY_PORT `
         -WarningAction SilentlyContinue -InformationLevel Quiet `
         -ErrorAction SilentlyContinue
@@ -106,10 +161,6 @@ function Get-ProxyStatus {
 }
 
 function Start-Proxy {
-    <#
-    .SYNOPSIS
-      Launch v2rayN and wait for proxy to become ready.
-    #>
     Write-Step "Checking proxy status..."
 
     $status = Get-ProxyStatus
@@ -124,11 +175,20 @@ function Start-Proxy {
         Start-Sleep -Seconds 2
     }
 
-    Write-Step "Starting v2rayN..."
-    if (-not (Test-Path $V2RAYN_EXE)) {
-        Write-Fail "v2rayN executable not found at: $V2RAYN_EXE"
+    if (-not $V2RAYN_EXE -or -not (Test-Path $V2RAYN_EXE)) {
+        Write-Fail "v2rayN not found. Please configure:"
+        Write-Host ""
+        Write-Host "  Option 1: Create proxy-config.json in scripts/ directory:"
+        Write-Host '    { "v2rayN_exe": "D:\\path\\to\\v2rayN.exe", "proxy_port": 10808 }'
+        Write-Host ""
+        Write-Host "  Option 2: Set environment variable:"
+        Write-Host '    $env:V2RAYN_EXE = "D:\path\to\v2rayN.exe"'
+        Write-Host ""
+        Write-Host "  Searched paths: Desktop, AppData, Program Files"
         return $false
     }
+
+    Write-Step "Starting v2rayN from: $V2RAYN_EXE"
 
     try {
         $proc = Start-Process -FilePath $V2RAYN_EXE -WorkingDirectory $V2RAYN_DIR -WindowStyle Hidden
@@ -138,8 +198,7 @@ function Start-Proxy {
         return $false
     }
 
-    # Wait for proxy to become available
-    Write-Step "Waiting for proxy to become available (timeout: ${TimeoutSeconds}s)..."
+    Write-Step "Waiting for proxy port $PROXY_PORT (timeout: ${TimeoutSeconds}s)..."
     $waited = 0
     do {
         Start-Sleep -Seconds 1
@@ -149,7 +208,6 @@ function Start-Proxy {
             -ErrorAction SilentlyContinue
         if ($conn) {
             Write-OK "Proxy ready after ${waited}s"
-            # Give it a moment to fully initialize
             Start-Sleep -Seconds 1
             return $true
         }
@@ -160,15 +218,10 @@ function Start-Proxy {
 }
 
 function Stop-Proxy {
-    <#
-    .SYNOPSIS
-      Stop v2rayN and its core processes.
-    #>
     Write-Step "Stopping v2rayN..."
 
     $stopped = $false
 
-    # Stop v2rayN
     $proc = Get-Process -Name "v2rayN" -ErrorAction SilentlyContinue
     if ($proc) {
         try {
@@ -176,13 +229,12 @@ function Stop-Proxy {
             Write-OK "v2rayN stopped (PID: $($proc.Id))"
             $stopped = $true
         } catch {
-            Write-Fail "Failed to stop v2rayN: $_"
+            Write-Fail "Failed to stop v2rayN: $($_.Exception.Message)"
         }
     } else {
         Write-Warn "v2rayN not running"
     }
 
-    # Stop core processes
     foreach ($name in @("xray", "sing-box", "mihomo")) {
         $core = Get-Process -Name $name -ErrorAction SilentlyContinue
         if ($core) {
@@ -195,7 +247,6 @@ function Stop-Proxy {
         }
     }
 
-    # Clear proxy environment variables for current process
     Remove-Item Env:\$ENV_HTTP -ErrorAction SilentlyContinue
     Remove-Item Env:\$ENV_HTTPS -ErrorAction SilentlyContinue
     Remove-Item Env:\$ENV_ALL -ErrorAction SilentlyContinue
@@ -205,14 +256,6 @@ function Stop-Proxy {
 }
 
 function Set-ProxyEnv {
-    <#
-    .SYNOPSIS
-      Output commands to set proxy environment variables.
-      Call this and then evaluate the output in the calling shell.
-    .DESCRIPTION
-      Sets HTTP_PROXY, HTTPS_PROXY, ALL_PROXY for both HTTP and SOCKS5.
-      Also sets NO_PROXY to exclude local/Chinese sites.
-    #>
     $socks5Url = "socks5://${PROXY_HOST}:${PROXY_PORT}"
     $httpUrl   = "http://${PROXY_HOST}:${PROXY_PORT}"
 
@@ -226,7 +269,6 @@ function Set-ProxyEnv {
     Write-Host "  `$env:NO_PROXY    = '$NO_PROXY_VAL'"
     Write-Host ""
 
-    # Actually set them for this process
     $env:HTTP_PROXY  = $httpUrl
     $env:HTTPS_PROXY = $httpUrl
     $env:ALL_PROXY   = $socks5Url
@@ -243,10 +285,6 @@ function Set-ProxyEnv {
 }
 
 function Test-Connectivity {
-    <#
-    .SYNOPSIS
-      Test if a URL is reachable through the proxy.
-    #>
     param(
         [string]$Url = $TestUrl,
         [int]$TimeoutSec = 10
@@ -255,7 +293,6 @@ function Test-Connectivity {
     Write-Step "Testing connectivity to: $Url"
 
     try {
-        # Use curl with SOCKS5 proxy
         $result = curl.exe -s -o NUL -w "%{http_code}" `
             --socks5-hostname "${PROXY_HOST}:${PROXY_PORT}" `
             --connect-timeout $TimeoutSec `
@@ -276,10 +313,6 @@ function Test-Connectivity {
 }
 
 function Test-AllSites {
-    <#
-    .SYNOPSIS
-      Test connectivity to commonly blocked sites.
-    #>
     $sites = @(
         @{ Name = "Google";     Url = "https://www.google.com" },
         @{ Name = "GitHub";     Url = "https://github.com" },
@@ -314,10 +347,22 @@ Write-Host ""
 Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Magenta
 Write-Host "  🌐 v2rayN Proxy Manager" -ForegroundColor Magenta
 Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Magenta
+
+if (-not $V2RAYN_EXE) {
+    Write-Host ""
+    Write-Warn "v2rayN path not configured (will not auto-start)"
+    Write-Host "  Auto-detection failed. To enable auto-start, create proxy-config.json"
+    Write-Host "  or set `$env:V2RAYN_EXE. See SKILL.md for details."
+}
+
 Write-Host ""
 
 switch ($Action) {
     "start" {
+        if (-not $V2RAYN_EXE) {
+            Write-Fail "Cannot start: v2rayN path unknown. Configure first."
+            exit 1
+        }
         $result = Start-Proxy
         if ($result) {
             Set-ProxyEnv | Out-Null
@@ -348,9 +393,15 @@ switch ($Action) {
         if ($status.Running) {
             Write-OK $status.Message
             Write-Host "  Proxy URL: socks5://${PROXY_HOST}:${PROXY_PORT}" -ForegroundColor Gray
+            if ($V2RAYN_EXE) {
+                Write-Host "  v2rayN path: $V2RAYN_EXE" -ForegroundColor Gray
+            }
             exit 0
         } else {
             Write-Fail $status.Message
+            if (-not $V2RAYN_EXE) {
+                Write-Warn "v2rayN path not configured. Start manually and use 'status' to verify."
+            }
             exit 1
         }
     }
@@ -368,7 +419,7 @@ switch ($Action) {
     "env" {
         $status = Get-ProxyStatus
         if (-not $status.Running) {
-            Write-Fail "Proxy is NOT running. Environment variables may be invalid."
+            Write-Warn "Proxy is NOT running. Environment variables may be invalid."
         }
         Set-ProxyEnv | Out-Null
         exit 0
